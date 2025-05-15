@@ -4,7 +4,7 @@ import time
 import threading
 import contextvars
 import dataclasses
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Callable, Coroutine
 import functools
 from smolagents import CodeAgent, WebSearchTool, InferenceClientModel, Tool
 from fastapi import FastAPI, HTTPException, Request
@@ -43,6 +43,52 @@ request_context_var: contextvars.ContextVar[RequestContext] = contextvars.Contex
 )
 
 
+def run_in_main_loop(
+    coroutine_callable: Callable[[], Coroutine[Any, Any, Any]],
+    timeout: float = 15.0,
+):
+    """
+    Runs an async function (via a callable that produces its coroutine, e.g., a partial)
+    synchronously in the main event loop.
+    """
+    try:
+        request_ctx = request_context_var.get()
+        event_loop = request_ctx.event_loop
+    except LookupError:
+        print(
+            f"[{threading.current_thread().name}] run_in_main_loop: Context (for event loop) not available"
+        )
+        return {"error": "Context (for event loop) not available"}
+
+    try:
+        coroutine = coroutine_callable()
+    except Exception as e:
+        print(
+            f"[{threading.current_thread().name}] run_in_main_loop: Error creating coroutine for {coroutine_callable.__name__}: {e}"
+        )
+        return {
+            "error": f"Error creating coroutine for {coroutine_callable.__name__}: {str(e)}"
+        }
+
+    future = asyncio.run_coroutine_threadsafe(coroutine, event_loop)
+
+    try:
+        return future.result(timeout=timeout)
+    except asyncio.TimeoutError:
+        print(
+            f"[{threading.current_thread().name}] run_in_main_loop: Timeout waiting for {coroutine_callable.__name__} (context: {request_ctx.request_id})"
+        )
+        return {
+            "error": f"Timeout waiting for {coroutine_callable.__name__} (context: {request_ctx.request_id})",
+            "timeout": True,
+        }
+    except Exception as e:
+        print(f"[{threading.current_thread().name}] run_in_main_loop: Error")
+        return {
+            "error": f"Error running {coroutine_callable.__name__}: {str(e)}",
+        }
+
+
 class Item(Base):
     __tablename__ = "items"
     id = Column(Integer, primary_key=True, index=True)
@@ -68,92 +114,43 @@ class DatabaseItemFetcherTool(Tool):
     def __init__(self):
         super().__init__()
 
-    def forward(self, item_id: int):
-        async def _async_fetch_item_helper(id_to_fetch: int):
-            current_thread_name = threading.current_thread().name
-            print(
-                f"[{current_thread_name}] Tool's _async_fetch_item_helper: Fetching item {id_to_fetch}"
-            )
-            try:
-                # This relies on the context being correctly propagated to this thread
-                request_ctx = request_context_var.get()
-                current_session_maker = request_ctx.db_session_maker
-            except LookupError:
-                print(
-                    f"[{current_thread_name}] Tool's _async_fetch_item_helper: Error - request_context_var not set."
-                )
-                return {
-                    "error": "Context not available for DB operation in tool.",
-                    "id": id_to_fetch,
-                }
-
-            print(
-                f"[{current_thread_name}] Tool's _async_fetch_item_helper: Using session_maker for item {id_to_fetch}"
-            )
-            try:
-                async with current_session_maker() as session:
-                    result = await session.execute(
-                        select(Item).where(Item.id == id_to_fetch)
-                    )
-                    item = result.scalars().first()
-                    if item:
-                        print(
-                            f"[{current_thread_name}] Tool's _async_fetch_item_helper: Item {id_to_fetch} found."
-                        )
-                        return item.to_dict()
-                    else:
-                        print(
-                            f"[{current_thread_name}] Tool's _async_fetch_item_helper: Item {id_to_fetch} not found."
-                        )
-                        return {
-                            "error": f"Item with ID {id_to_fetch} not found.",
-                            "id": id_to_fetch,
-                            "found": False,
-                        }
-            except Exception as e:
-                print(
-                    f"[{current_thread_name}] Tool's _async_fetch_item_helper: DB error for item {id_to_fetch}: {e}"
-                )
-                return {
-                    "error": f"Database error while fetching item {id_to_fetch}: {str(e)}",
-                    "id": id_to_fetch,
-                }
-
+    async def db_call(self, item_id: int):
+        """Asynchronously fetches an item from the database."""
         try:
             request_ctx = request_context_var.get()
-            event_loop = request_ctx.event_loop
+            current_session_maker = request_ctx.db_session_maker
         except LookupError:
-            print(
-                f"[{threading.current_thread().name}] Tool's forward: Error - request_context_var not set when trying to get event_loop."
-            )
             return {
-                "error": "Context not available for event loop in tool.",
+                "error": "Context not available for DB operation in tool's db_call.",
                 "id": item_id,
             }
-
-        future = asyncio.run_coroutine_threadsafe(
-            _async_fetch_item_helper(item_id), event_loop
-        )
 
         try:
-            return future.result(timeout=15.0)
-        except asyncio.TimeoutError:
-            print(
-                f"[{threading.current_thread().name}] Tool's forward: Timeout waiting for DB operation for item ID {item_id}."
-            )
-            return {
-                "error": f"Timeout waiting for database operation for item ID {item_id}.",
-                "id": item_id,
-                "timeout": True,
-            }
+            async with current_session_maker() as session:
+                result = await session.execute(select(Item).where(Item.id == item_id))
+                item = result.scalars().first()
+                if item:
+                    return item.to_dict()
+                else:
+                    return {
+                        "error": f"Item with ID {item_id} not found.",
+                        "id": item_id,
+                        "found": False,
+                    }
         except Exception as e:
-            print(
-                f"[{threading.current_thread().name}] Tool's forward: Error executing DB fetch for item ID {item_id}: {e}"
-            )
             return {
-                "error": f"Error executing database fetch for item ID {item_id}: {str(e)}",
+                "error": f"Database error while fetching item {item_id}: {str(e)}",
                 "id": item_id,
             }
+
+    def forward(self, item_id: int):
+        """Synchronously fetches an item by creating a partial of the async db_call method
+        and running it in the main event loop."""
+        db_call_partial = functools.partial(self.db_call, item_id=item_id)
+        return run_in_main_loop(
+            coroutine_callable=db_call_partial,
+            timeout=15.0,
+        )
 
 
 def create_engine(
